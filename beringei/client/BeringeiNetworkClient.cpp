@@ -7,12 +7,14 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  */
 
-#include "BeringeiNetworkClient.h"
+#include "beringei/client/BeringeiNetworkClient.h"
 
 #include <atomic>
 
 #include <folly/Conv.h>
 #include <folly/SocketAddress.h>
+#include <folly/executors/GlobalExecutor.h>
+#include <folly/futures/Future.h>
 #include <thrift/lib/cpp/async/TAsyncSocket.h>
 #include <thrift/lib/cpp2/async/HeaderClientChannel.h>
 
@@ -32,8 +34,8 @@ DEFINE_int32(
     "Processing timeout for talking to Gorilla hosts.");
 
 using namespace apache::thrift;
-using std::vector;
 using std::unique_ptr;
+using std::vector;
 
 namespace facebook {
 namespace gorilla {
@@ -41,8 +43,9 @@ namespace gorilla {
 static const std::string kStaleShardInfoUsed =
     "gorilla_network_client.stale_shard_info_used";
 
-static const int kDefaultThriftTimeoutMs =
-    2 * kGorillaMsPerSecond; // 60 seconds
+static const int kDefaultThriftTimeoutMs = 2 * kGorillaMsPerSecond;
+
+const static int kSleepBetweenRetrySecs = 10;
 
 BeringeiNetworkClient::BeringeiNetworkClient(
     const std::string& serviceName,
@@ -89,73 +92,47 @@ class RequestHandler : public apache::thrift::RequestCallback {
   std::function<void(bool, ClientReceiveState&)> callback_;
 };
 
+folly::Future<std::vector<DataPoint>> BeringeiNetworkClient::futurePerformPut(
+    PutDataRequest& request,
+    const std::pair<std::string, int>& hostInfo) {
+  auto client =
+      getBeringeiThriftClient(hostInfo, folly::getIOExecutor()->getEventBase());
+  if (isShadow()) {
+    client->future_putDataPoints(request);
+    return folly::makeFuture(std::vector<DataPoint>({}));
+  } else {
+    return client->future_putDataPoints(request)
+        .then([](PutDataResult& result) { return std::move(result.data); })
+        .onError([dps = request.data](const std::exception& e) mutable {
+          LOG(ERROR) << "putDataPoints failed: " << e.what();
+          return std::move(dps);
+        });
+  }
+}
+
 vector<DataPoint> BeringeiNetworkClient::performPut(PutRequestMap& requests) {
-  std::atomic<int> numActiveRequests(0);
-  std::vector<std::shared_ptr<BeringeiServiceAsyncClient>> clients;
-  std::vector<DataPoint> dropped;
-  std::mutex droppedMutex;
-
-  for (auto& request : requests) {
-    try {
-      auto client = this->getBeringeiThriftClient(
-          request.first.first, request.first.second);
-
-      // Keep clients alive
-      clients.push_back(client);
-      std::unique_ptr<apache::thrift::RequestCallback> callback(
-          new RequestHandler(
-              false, [&](bool success, ClientReceiveState& state) {
-                if (success) {
-                  try {
-                    PutDataResult putDataResult;
-                    client->recv_putDataPoints(putDataResult, state);
-
-                    std::lock_guard<std::mutex> guard(droppedMutex);
-                    dropped.insert(
-                        dropped.end(),
-                        std::make_move_iterator(putDataResult.data.begin()),
-                        std::make_move_iterator(putDataResult.data.end()));
-                  } catch (const std::exception& e) {
-                    LOG(ERROR) << "Exception from recv_putData: " << e.what();
-                    std::lock_guard<std::mutex> guard(droppedMutex);
-                    dropped.insert(
-                        dropped.end(),
-                        std::make_move_iterator(request.second.data.begin()),
-                        std::make_move_iterator(request.second.data.end()));
-                  }
-                } else {
-                  auto exn = state.exceptionWrapper();
-                  auto error = exn.what().toStdString();
-                  LOG(ERROR) << "putDataPoints Failed. Reason: " << error;
-
-                  std::lock_guard<std::mutex> guard(droppedMutex);
-                  dropped.insert(
-                      dropped.end(),
-                      std::make_move_iterator(request.second.data.begin()),
-                      std::make_move_iterator(request.second.data.end()));
-                }
-
-                if (--numActiveRequests == 0) {
-                  eventBaseManager_.getEventBase()->terminateLoopSoon();
-                }
-              }));
-
-      client->putDataPoints(std::move(callback), request.second);
-      numActiveRequests++;
-    } catch (std::exception& e) {
-      LOG(ERROR) << e.what();
-      std::lock_guard<std::mutex> guard(droppedMutex);
-      dropped.insert(
-          dropped.end(),
-          std::make_move_iterator(request.second.data.begin()),
-          std::make_move_iterator(request.second.data.end()));
-    }
+  std::vector<folly::Future<std::vector<DataPoint>>> pendingResponses;
+  pendingResponses.reserve(requests.size());
+  for (auto& mapEntry : requests) {
+    auto& hostInfo = mapEntry.first;
+    auto& request = mapEntry.second;
+    pendingResponses.push_back(futurePerformPut(request, hostInfo));
   }
 
-  if (numActiveRequests > 0) {
-    eventBaseManager_.getEventBase()->loopForever();
-  }
-  return dropped;
+  std::vector<DataPoint> result;
+
+  folly::collectAll(pendingResponses)
+      .then([&](auto& responses) {
+        for (auto& maybeDropped : responses) {
+          auto& dps = maybeDropped.value();
+          result.insert(
+              result.end(),
+              std::make_move_iterator(dps.begin()),
+              std::make_move_iterator(dps.end()));
+        }
+      })
+      .get();
+  return result;
 }
 
 void markRequestResultFailed(const GetDataRequest& req, GetDataResult& res) {
@@ -173,8 +150,7 @@ void BeringeiNetworkClient::performGet(GetRequestMap& requests) {
   std::shared_ptr<BeringeiServiceAsyncClient> client = nullptr;
   for (auto& request : requests) {
     try {
-      client = this->getBeringeiThriftClient(
-          request.first.first, request.first.second);
+      client = getBeringeiThriftClient(request.first);
     } catch (const std::exception& e) {
       LOG(ERROR) << "Failed to construct BeringeiServiceAsyncClient for"
                  << " host:port " << request.first.first << ":"
@@ -198,7 +174,7 @@ void BeringeiNetworkClient::performGet(GetRequestMap& requests) {
                   request.second.first, request.second.second);
             }
           } else {
-            auto exn = state.exceptionWrapper();
+            auto exn = state.exception();
             auto error = exn.what().toStdString();
             LOG(ERROR) << "getData failed. Reason: " << error;
 
@@ -207,7 +183,7 @@ void BeringeiNetworkClient::performGet(GetRequestMap& requests) {
           }
 
           if (--numActiveRequests == 0) {
-            eventBaseManager_.getEventBase()->terminateLoopSoon();
+            getEventBase()->terminateLoopSoon();
           }
         }));
 
@@ -216,29 +192,32 @@ void BeringeiNetworkClient::performGet(GetRequestMap& requests) {
   }
 
   if (numActiveRequests > 0) {
-    eventBaseManager_.getEventBase()->loopForever();
+    getEventBase()->loopForever();
   }
 }
 
-void BeringeiNetworkClient::performShardDataBucketGet(
-    int64_t begin,
-    int64_t end,
-    int64_t shardId,
-    int32_t offset,
-    int32_t limit,
-    GetShardDataBucketResult& result) {
+folly::Future<GetDataResult> BeringeiNetworkClient::performGet(
+    const std::pair<std::string, int>& hostInfo,
+    const GetDataRequest& request,
+    folly::EventBase* eb) {
+  return getBeringeiThriftClient(hostInfo, eb)->future_getData(request);
+}
+
+void BeringeiNetworkClient::performScanShard(
+    const ScanShardRequest& request,
+    ScanShardResult& result) {
   std::pair<std::string, int> hostInfo;
-  bool success = getHostForShard(shardId, hostInfo);
+  bool success = getHostForShard(request.shardId, hostInfo);
 
   if (!success) {
     result.status = StatusCode::RPC_FAIL;
-    LOG(ERROR) << "Could not get host for shard " << shardId;
+    LOG(ERROR) << "Could not get host for shard " << request.shardId;
     return;
   }
 
   std::shared_ptr<BeringeiServiceAsyncClient> client = nullptr;
   try {
-    client = this->getBeringeiThriftClient(hostInfo.first, hostInfo.second);
+    client = this->getBeringeiThriftClient(hostInfo);
   } catch (const std::exception& e) {
     result.status = StatusCode::RPC_FAIL;
     LOG(ERROR) << "Failed to construct BeringeiServiceAsyncClient for"
@@ -248,11 +227,149 @@ void BeringeiNetworkClient::performShardDataBucketGet(
   }
 
   try {
-    client->sync_getShardDataBucket(result, begin, end, shardId, offset, limit);
+    client->sync_scanShard(result, request);
   } catch (const std::exception& e) {
     result.status = StatusCode::RPC_FAIL;
     LOG(ERROR) << "Got exception talking to Gorilla: " << e.what();
   }
+}
+
+folly::Future<ScanShardResult> BeringeiNetworkClient::performScanShard(
+    const std::pair<std::string, int>& hostInfo,
+    const ScanShardRequest& request,
+    folly::EventBase* eb) {
+  return getBeringeiThriftClient(hostInfo, eb)->future_scanShard(request);
+}
+
+bool BeringeiNetworkClient::getShardKeys(
+    int shardNumber,
+    int limit,
+    int offset,
+    std::vector<KeyUpdateTime>& keys) {
+  std::pair<std::string, int> hostInfo;
+  if (!getHostForShard(shardNumber, hostInfo)) {
+    throw std::runtime_error(
+        folly::format("Couldn't find shard owner {}", shardNumber).str());
+  }
+
+  std::shared_ptr<BeringeiServiceAsyncClient> client =
+      getBeringeiThriftClient(hostInfo);
+
+  GetLastUpdateTimesRequest req;
+  GetLastUpdateTimesResult result;
+  req.offset = offset;
+  req.shardId = shardNumber;
+  req.limit = limit;
+
+  client->sync_getLastUpdateTimes(result, req);
+  keys = std::move(result.keys);
+  return result.moreResults;
+}
+
+void BeringeiNetworkClient::getLastUpdateTimesForHost(
+    uint32_t /*minLastUpdateTime*/,
+    uint32_t maxKeysPerRequest,
+    const std::string& host,
+    int port,
+    const std::vector<int64_t>& shards,
+    uint32_t timeoutSeconds,
+    std::function<bool(const std::vector<KeyUpdateTime>& keys)> callback) {
+  time_t startTime = time(nullptr);
+
+  stopRequests_ = false;
+
+  std::unique_lock<std::mutex> lock(stoppingMutex_);
+
+  try {
+    auto client = getBeringeiThriftClient({host, port});
+    for (auto& shard : shards) {
+      GetLastUpdateTimesRequest req;
+      GetLastUpdateTimesResult result;
+      req.offset = 0;
+      req.shardId = shard;
+      req.limit = maxKeysPerRequest;
+      bool continueOperation = true;
+
+      do {
+        bool success = false;
+        try {
+          client->sync_getLastUpdateTimes(result, req);
+          success = true;
+        } catch (std::exception& e) {
+          LOG(ERROR) << e.what();
+        }
+
+        if (success) { // we got results back
+          continueOperation = callback(result.keys);
+          if (!result.moreResults) {
+            break;
+          }
+          req.offset += maxKeysPerRequest;
+        }
+
+        if (continueOperation) {
+          continueOperation = time(nullptr) - startTime < timeoutSeconds &&
+              !stopRequests_.load();
+        }
+
+        if (continueOperation && !success) {
+          // Let's not hammer with immediate requests in the loop and
+          // let Beringei to take a rest for a little bit.
+          continueOperation = !stopping_.wait_for(
+              lock, std::chrono::seconds(kSleepBetweenRetrySecs), [this]() {
+                return stopRequests_.load();
+              });
+        }
+      } while (continueOperation);
+
+      if (!continueOperation) {
+        LOG(INFO) << "Operation stopped by the caller or a timeout was reached";
+        break;
+      }
+    }
+  } catch (std::exception& e) {
+    LOG(ERROR) << e.what();
+  }
+}
+
+void BeringeiNetworkClient::getLastUpdateTimes(
+    uint32_t minLastUpdateTime,
+    uint32_t maxKeysPerRequest,
+    uint32_t timeoutSeconds,
+    std::function<bool(const std::vector<KeyUpdateTime>& keys)> callback) {
+  int numShards = getNumShards();
+  std::map<std::pair<std::string, int>, std::vector<int64_t>> shardsPerHost;
+
+  for (int i = 0; i < numShards; i++) {
+    std::pair<std::string, int> hostInfo;
+    if (getHostForShard(i, hostInfo)) {
+      shardsPerHost[hostInfo].push_back(i);
+    } else {
+      LOG(WARNING) << "Nobody owns shard " << i;
+    }
+  }
+
+  std::vector<std::thread> threads;
+  for (auto& iter : shardsPerHost) {
+    threads.push_back(std::thread(
+        &BeringeiNetworkClient::getLastUpdateTimesForHost,
+        this,
+        minLastUpdateTime,
+        maxKeysPerRequest,
+        iter.first.first,
+        iter.first.second,
+        iter.second,
+        timeoutSeconds,
+        callback));
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+}
+
+int BeringeiNetworkClient::getShardForDataPoint(const DataPoint& dp) {
+  return dp.key.shardId;
 }
 
 bool BeringeiNetworkClient::addDataPointToRequest(
@@ -272,19 +389,41 @@ bool BeringeiNetworkClient::addDataPointToRequest(
   return requests[hostInfo].data.size() < FLAGS_gorilla_max_batch_size;
 }
 
-std::shared_ptr<BeringeiServiceAsyncClient>
-BeringeiNetworkClient::getBeringeiThriftClient(
-    const std::string& hostAddress,
-    int port) {
-  folly::SocketAddress address(hostAddress, port, true);
-  auto socket = apache::thrift::async::TAsyncSocket::newSocket(
-      eventBaseManager_.getEventBase(), address);
-  auto channel =
-      apache::thrift::HeaderClientChannel::newChannel(std::move(socket));
-  uint32_t timeout = FLAGS_gorilla_processing_timeout == 0
+void BeringeiNetworkClient::addKeyToGetRequest(
+    const Key& key,
+    GetRequestMap& requests) {
+  addKeyToRequest<GetRequestMap>(key, requests);
+}
+
+void BeringeiNetworkClient::addKeyToGetRequest(
+    size_t index,
+    const Key& key,
+    MultiGetRequestMap& requests) {
+  std::pair<std::string, int> hostInfo;
+  bool success = getHostForShard(key.shardId, hostInfo);
+  if (!success) {
+    return;
+  }
+
+  requests[hostInfo].first.keys.push_back(key);
+  requests[hostInfo].second.push_back(index);
+}
+
+uint32_t BeringeiNetworkClient::getTimeoutMs() {
+  return (FLAGS_gorilla_processing_timeout == 0)
       ? kDefaultThriftTimeoutMs
       : FLAGS_gorilla_processing_timeout;
-  channel->setTimeout(timeout);
+}
+
+std::shared_ptr<BeringeiServiceAsyncClient>
+BeringeiNetworkClient::getBeringeiThriftClient(
+    const std::pair<std::string, int>& hostInfo,
+    folly::EventBase* eb) {
+  folly::SocketAddress address(hostInfo.first, hostInfo.second, true);
+  auto socket = apache::thrift::async::TAsyncSocket::newSocket(eb, address);
+  auto channel =
+      apache::thrift::HeaderClientChannel::newChannel(std::move(socket));
+  channel->setTimeout(getTimeoutMs());
   return std::make_shared<BeringeiServiceAsyncClient>(std::move(channel));
 }
 
@@ -397,6 +536,7 @@ void BeringeiNetworkClient::addCacheEntry(
 
 void BeringeiNetworkClient::stopRequests() {
   stopRequests_ = true;
+  stopping_.notify_all();
 }
 
 std::string BeringeiNetworkClient::getServiceName() {
@@ -407,5 +547,10 @@ bool BeringeiNetworkClient::isCorrespondingService(
     const std::string& serviceName) {
   return serviceName_ == serviceName;
 }
+
+bool BeringeiNetworkClient::isShadow() const {
+  return isShadow_;
 }
-} // facebook:gorilla
+
+} // namespace gorilla
+} // namespace facebook

@@ -13,15 +13,15 @@
 #include "beringei/lib/SimpleMemoryUsageGuard.h"
 #include "beringei/plugins/BeringeiConfigurationAdapter.h"
 
+#include <folly/init/Init.h>
 #include <thrift/lib/cpp/concurrency/Mutex.h>
 #include <thrift/lib/cpp/concurrency/PosixThreadFactory.h>
 #include <thrift/lib/cpp/concurrency/Thread.h>
-#include <thrift/lib/cpp/server/TServer.h>
 #include <thrift/lib/cpp/transport/THeader.h>
-#include <thrift/lib/cpp/util/ScopedServerThread.h>
 #include <thrift/lib/cpp2/async/AsyncProcessor.h>
 #include <thrift/lib/cpp2/server/BaseThriftServer.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
+#include <thrift/lib/cpp2/util/ScopedServerThread.h>
 
 #include <chrono>
 
@@ -52,9 +52,7 @@ BeringeiServiceHandler* handlerPtr;
 std::shared_ptr<apache::thrift::ThriftServer> server;
 
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(fLS::FLAGS_service_name.c_str());
-  google::ParseCommandLineFlags(
-      &argc, &argv, true /* remove from argv and modify argc after parsing */);
+  folly::init(&argc, &argv, true);
 
   // Don't actually do anything with the stats.
   GorillaStatsManager::initialize(fLS::FLAGS_service_name, nullptr);

@@ -7,12 +7,14 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  */
 
-#include "BucketLogWriter.h"
+#include "beringei/lib/BucketLogWriter.h"
 
-#include "GorillaStatsManager.h"
+#include <glog/logging.h>
 
+#include "beringei/lib/BucketUtils.h"
+#include "beringei/lib/GorillaStatsManager.h"
 #include "beringei/lib/GorillaTimeConstants.h"
-#include "glog/logging.h"
+#include "beringei/lib/Timer.h"
 
 namespace facebook {
 namespace gorilla {
@@ -20,9 +22,13 @@ namespace gorilla {
 DECLARE_int32(data_log_buffer_size);
 
 static const int kLogFileBufferSize = FLAGS_data_log_buffer_size;
-static const std::string kLogDataFailures = ".log_data_failures";
+static const std::string kLogDataDequeueLatencyUs =
+    "log_data_dequeue_latency_us";
+static const std::string kLogDataFailures = "log_data_failures";
+static const std::string kLogDataEnqueueFailures = "log_data_enqueue_failures";
+static const std::string kLogFileOpenRetries = "log_file_open_retries";
 static const std::string kLogFilesystemFailures =
-    ".failed_writes.log_filesystem";
+    "failed_writes.log_filesystem";
 
 // These are not valid indexes so they can be used to control starting
 // and stopping shards.
@@ -35,8 +41,6 @@ static const int kMaxActiveBuckets = 2;
 static const int kFileOpenRetries = 5;
 static const int kSleepUsBetweenFailures = 100 * kGorillaUsecPerMs; // 100 us
 const std::string BucketLogWriter::kLogFilePrefix = "log";
-
-uint32_t BucketLogWriter::numShards_ = 1;
 
 BucketLogWriter::BucketLogWriter(
     int windowSize,
@@ -52,7 +56,7 @@ BucketLogWriter::BucketLogWriter(
       // One `allowedTimestampBehind` delay to allow the data to come in
       // and one more delay to allow the data to be dequeued and written.
       waitTimeBeforeClosing_(allowedTimestampBehind * 2),
-      keepLogFilesAroundTime_(windowSize * 2) {
+      keepLogFilesAroundTime_(BucketUtils::duration(2, windowSize)) {
   CHECK_GT(windowSize, allowedTimestampBehind)
       << "Window size " << windowSize
       << " must be larger than allowedTimestampBehind "
@@ -94,6 +98,18 @@ void BucketLogWriter::stopWriterThread() {
   }
 }
 
+uint32_t BucketLogWriter::bucket(uint64_t unixTime, int shardId) const {
+  return BucketUtils::bucket(unixTime, windowSize_, shardId);
+}
+
+uint64_t BucketLogWriter::timestamp(uint32_t bucket, int shardId) const {
+  return BucketUtils::timestamp(bucket, windowSize_, shardId);
+}
+
+uint64_t BucketLogWriter::duration(uint32_t buckets) const {
+  return BucketUtils::duration(buckets, windowSize_);
+}
+
 void BucketLogWriter::flushQueue() {
   stopWriterThread();
   while (writeOneLogEntry(false))
@@ -113,7 +129,7 @@ void BucketLogWriter::logData(
   info.value = value;
 
   if (!logDataQueue_.write(std::move(info))) {
-    GorillaStatsManager::addStatValue(kLogDataFailures, 1);
+    GorillaStatsManager::addStatValue(kLogDataEnqueueFailures, 1);
   }
 }
 
@@ -126,6 +142,7 @@ bool BucketLogWriter::writeOneLogEntry(bool blockingRead) {
     return false;
   }
 
+  Timer dequeueTimer(true);
   if (blockingRead) {
     // First read is blocking then as many as possible without blocking.
     logDataQueue_.blockingRead(info);
@@ -135,6 +152,8 @@ bool BucketLogWriter::writeOneLogEntry(bool blockingRead) {
   while (logDataQueue_.read(info)) {
     data.push_back(std::move(info));
   }
+  GorillaStatsManager::addStatValue(
+      kLogDataDequeueLatencyUs, dequeueTimer.get());
 
   bool onePreviousLogWriterCleared = false;
 
@@ -142,10 +161,10 @@ bool BucketLogWriter::writeOneLogEntry(bool blockingRead) {
     if (info.index == kStartShardIndex) {
       ShardWriter writer;
 
-      // Randomly select the next clear time between windowSize_ and
-      // windowSize_ * 2 to spread out the clear operations.
-      writer.nextClearTimeSecs =
-          time(nullptr) + windowSize_ + (random() % windowSize_);
+      // Select the next clear time to be the start of a bucket between
+      // windowSize_ and windowSize_ * 2 to spread out the clear operations.
+      writer.nextClearTimeSecs = BucketUtils::floorTimestamp(
+          time(nullptr) + duration(2), windowSize_, info.shardId);
       writer.fileUtils.reset(
           new FileUtils(info.shardId, kLogFilePrefix, dataDirectory_));
       shardWriters_.insert(std::make_pair(info.shardId, std::move(writer)));
@@ -161,13 +180,14 @@ bool BucketLogWriter::writeOneLogEntry(bool blockingRead) {
         continue;
       }
 
-      int bucket = info.unixTime / windowSize_;
+      int b = bucket(info.unixTime, info.shardId);
       ShardWriter& shardWriter = iter->second;
-      auto& logWriter = shardWriter.logWriters[bucket];
+      auto& logWriter = shardWriter.logWriters[b];
 
       // If this bucket doesn't have a file open yet, open it now.
       if (!logWriter) {
         for (int i = 0; i < kFileOpenRetries; i++) {
+          GorillaStatsManager::addStatValue(kLogFileOpenRetries, i);
           auto f = shardWriter.fileUtils->open(
               info.unixTime, "wb", kLogFileBufferSize);
           if (f.file) {
@@ -182,21 +202,19 @@ bool BucketLogWriter::writeOneLogEntry(bool blockingRead) {
         }
       }
 
-      // Spread out opening the files for the next bucket in the last
-      // 1/4 of the time window based on the shard ID. This will avoid
-      // opening a lot of files simultaneously.
+      // Open files for the next bucket in the last 1/10 of the time window.
       uint32_t openNextFileTime =
-          windowSize_ * (bucket + 0.75 + 0.25 * info.shardId / numShards_);
+          timestamp(b, info.shardId) + windowSize_ * 0.9;
       if (time(nullptr) > openNextFileTime &&
-          shardWriter.logWriters.find(bucket + 1) ==
-              shardWriter.logWriters.end()) {
-        uint32_t baseTime = (bucket + 1) * windowSize_;
+          shardWriter.logWriters.find(b + 1) == shardWriter.logWriters.end()) {
+        uint32_t baseTime = timestamp(b + 1, info.shardId);
         LOG(INFO) << "Opening file in advance for shard " << info.shardId;
         for (int i = 0; i < kFileOpenRetries; i++) {
+          GorillaStatsManager::addStatValue(kLogFileOpenRetries, i);
           auto f =
               shardWriter.fileUtils->open(baseTime, "wb", kLogFileBufferSize);
           if (f.file) {
-            shardWriter.logWriters[bucket + 1].reset(
+            shardWriter.logWriters[b + 1].reset(
                 new DataLogWriter(std::move(f), baseTime));
             break;
           }
@@ -204,31 +222,35 @@ bool BucketLogWriter::writeOneLogEntry(bool blockingRead) {
           if (i == kFileOpenRetries - 1) {
             // This is kind of ok. We'll try again above.
             LOG(ERROR) << "Failed too many times to open log file " << f.name;
+            GorillaStatsManager::addStatValue(kLogFilesystemFailures, 1);
           }
           usleep(kSleepUsBetweenFailures);
         }
-      }
-
-      // Only clear at most one previous bucket because the operation
-      // is really slow and queue might fill up if multiple buckets
-      // are cleared.
-      if (!onePreviousLogWriterCleared &&
-          time(nullptr) % windowSize_ > waitTimeBeforeClosing_ &&
-          shardWriter.logWriters.find(bucket - 1) !=
-              shardWriter.logWriters.end()) {
-        shardWriter.logWriters.erase(bucket - 1);
-        onePreviousLogWriterCleared = true;
-      }
-
-      if (time(nullptr) > shardWriter.nextClearTimeSecs) {
-        shardWriter.fileUtils->clearTo(time(nullptr) - keepLogFilesAroundTime_);
-        shardWriter.nextClearTimeSecs += windowSize_;
       }
 
       if (logWriter) {
         logWriter->append(info.index, info.unixTime, info.value);
       } else {
         GorillaStatsManager::addStatValue(kLogDataFailures, 1);
+      }
+
+      // Only clear at most one previous bucket because the operation
+      // is really slow and queue might fill up if multiple buckets
+      // are cleared.
+      auto now = time(nullptr);
+      int nowBucket = bucket(now, info.shardId);
+      if (!onePreviousLogWriterCleared &&
+          now - BucketUtils::floorTimestamp(now, windowSize_, info.shardId) >
+              waitTimeBeforeClosing_ &&
+          shardWriter.logWriters.find(nowBucket - 1) !=
+              shardWriter.logWriters.end()) {
+        shardWriter.logWriters.erase(nowBucket - 1);
+        onePreviousLogWriterCleared = true;
+      }
+
+      if (now > shardWriter.nextClearTimeSecs) {
+        shardWriter.fileUtils->clearTo(time(nullptr) - keepLogFilesAroundTime_);
+        shardWriter.nextClearTimeSecs += duration(1);
       }
     }
   }
@@ -253,8 +275,12 @@ void BucketLogWriter::stopShard(int64_t shardId) {
 }
 
 void BucketLogWriter::startMonitoring() {
+  GorillaStatsManager::addStatExportType(kLogDataEnqueueFailures, SUM);
+  GorillaStatsManager::addStatExportType(kLogDataDequeueLatencyUs, AVG);
+  GorillaStatsManager::addStatExportType(kLogFileOpenRetries, SUM);
   GorillaStatsManager::addStatExportType(kLogDataFailures, SUM);
   GorillaStatsManager::addStatExportType(kLogFilesystemFailures, SUM);
 }
-}
-} // facebook:gorilla
+
+} // namespace gorilla
+} // namespace facebook

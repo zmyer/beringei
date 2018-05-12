@@ -8,7 +8,7 @@
  */
 
 #include <folly/FileUtil.h>
-#include <thrift/lib/cpp/util/ThriftSerializer.h>
+#include <folly/init/Init.h>
 #include <thrift/lib/cpp2/protocol/Serializer.h>
 #include <iostream>
 
@@ -35,7 +35,7 @@ std::vector<string> parseHostNames(string hostNames) {
 }
 
 int main(int argc, char** argv) {
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  folly::init(&argc, &argv, true);
 
   auto hostNames = parseHostNames(fLS::FLAGS_host_names);
   if (fLS::FLAGS_host_names.empty() || hostNames.size() == 0) {

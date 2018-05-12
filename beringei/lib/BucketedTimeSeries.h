@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-#include <folly/SmallLocks.h>
+#include <folly/synchronization/SmallLocks.h>
 #include "BucketStorage.h"
 #include "TimeSeriesStream.h"
 #include "beringei/if/gen-cpp2/beringei_data_types.h"
@@ -20,6 +20,7 @@
 namespace facebook {
 namespace gorilla {
 
+class BucketMap;
 // Holds a rolling window of TimeSeries data.
 class BucketedTimeSeries {
  public:
@@ -27,9 +28,10 @@ class BucketedTimeSeries {
   ~BucketedTimeSeries();
 
   // Initialize a BucketedTimeSeries with n historical buckets and
-  // one active bucket.
+  // one active bucket. The BucketedTimeSeries will ignore any points
+  // that predate minTimestamp and loaded block files that predate minBucket.
   // Not thread-safe.
-  void reset(uint8_t n);
+  void reset(uint8_t n, uint32_t minBucket, int64_t minTimestamp);
 
   // Add a data point to the given bucket. Returns true if data was
   // added, false if it was dropped. If category pointer is defined,
@@ -41,7 +43,7 @@ class BucketedTimeSeries {
       uint32_t timeSeriesId,
       uint16_t* category);
 
-  // Read out buckets.
+  // Read out buckets between begin and end inclusive, including current one.
   typedef std::vector<TimeSeriesBlock> Output;
   void get(uint32_t begin, uint32_t end, Output& out, BucketStorage* storage);
 
@@ -65,7 +67,7 @@ class BucketedTimeSeries {
 
   void setDataBlock(
       uint32_t position,
-      uint8_t numBuckets,
+      BucketStorage* storage,
       BucketStorage::BucketStorageId id);
 
   // Sets the current bucket. Flushes data from the previous bucket to
@@ -85,7 +87,11 @@ class BucketedTimeSeries {
   // Sets the ODS category for this time series.
   void setCategory(uint16_t category);
 
-  uint32_t getLastUpdateTime(BucketStorage* storage, uint32_t windowSize);
+  int32_t getFirstUpdateTime(BucketStorage* storage, const BucketMap& map);
+  uint32_t getLastUpdateTime(BucketStorage* storage, const BucketMap& map);
+
+  // Return age of bucket relative to current
+  int32_t getBucketAge(uint32_t bucket) const;
 
  private:
   // Open the next bucket for writes.

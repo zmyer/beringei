@@ -9,6 +9,11 @@
 
 #include "beringei/client/RequestBatchingQueue.h"
 
+DEFINE_int32(
+    beringei_client_queue_timeout_ms,
+    300,
+    "Time to wait for new datapoints to process, before flushing ready batches");
+
 namespace facebook {
 namespace gorilla {
 
@@ -37,6 +42,43 @@ bool RequestBatchingQueue::push(std::vector<DataPoint>& points) {
   }
 
   return true;
+}
+
+void RequestBatchingQueue::popForever(
+    std::function<bool(DataPoint& dp)> popCallback,
+    std::function<bool()> timeoutCallback) {
+  std::vector<DataPoint> points;
+  queue_.blockingRead(points);
+  bool continuePopping = true;
+  bool popped = true;
+  do {
+    if (popped) {
+      if (points.size() == 0) {
+        // Signals shutdown.
+        return;
+      }
+      numQueuedDataPoints_ -= points.size();
+
+      for (auto& dp : points) {
+        if (!popCallback(dp)) {
+          // Callback has had enough, but still push all the points in this
+          // vector.
+          continuePopping = false;
+        }
+      }
+    } else {
+      continuePopping = timeoutCallback();
+    }
+
+    if (!continuePopping) {
+      return;
+    }
+
+    popped = queue_.tryReadUntil(
+        std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(FLAGS_beringei_client_queue_timeout_ms),
+        points);
+  } while (true);
 }
 
 std::pair<bool, int> RequestBatchingQueue::pop(
@@ -73,5 +115,6 @@ void RequestBatchingQueue::flush(int n) {
     queue_.blockingWrite(std::move(points));
   }
 }
-}
-} // facebook::gorilla
+
+} // namespace gorilla
+} // namespace facebook

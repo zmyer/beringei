@@ -8,14 +8,13 @@
  */
 
 #include <gtest/gtest.h>
-#include <ext/hash_map>
+#include <unordered_map>
 
 #include <folly/String.h>
 #include "TestKeyList.h"
 
 #include "beringei/lib/CaseUtils.h"
 
-using __gnu_cxx::hash;
 using namespace ::testing;
 using namespace facebook::gorilla;
 
@@ -35,18 +34,12 @@ TEST(CaseUtilsTest, CaseHash) {
   EXPECT_NE(hash("foo"), hash("bar"));
 }
 
-TEST(CaseUtilsTest, ToLower) {
-  for (int i = 0; i < 256; i++) {
-    EXPECT_EQ(tolower(i), fastToLower(i));
-  }
-}
-
 const static int kNumHashes = 10000000;
 const static int kKeyListSize = 400000;
 
 TEST(CaseUtilsTest, Perf) {
   CaseHash hsh;
-  TestKeyList keyList(kKeyListSize);
+  TestKeyList keyList(kKeyListSize, 10);
   size_t x = 0;
   for (int i = 0; i < kNumHashes; i++) {
     x ^= hsh(keyList.testStr(i));
@@ -55,35 +48,11 @@ TEST(CaseUtilsTest, Perf) {
 }
 
 TEST(CaseUtilsTest, PerfComparison) {
-  __gnu_cxx::hash<const char*> hsh;
+  std::hash<std::string> hsh;
   TestKeyList keyList(kKeyListSize);
   size_t x = 0;
   for (int i = 0; i < kNumHashes; i++) {
     x ^= hsh(keyList.testStr(i));
-  }
-  LOG(INFO) << x;
-}
-
-TEST(CaseUtilsTest, DISABLED_ToLowerPerf) {
-  int64_t x = 0;
-  for (uint64_t i = 0; i < kNumHashes * 100; i++) {
-    x += tolower(i & 0xFF);
-  }
-  LOG(INFO) << x;
-}
-
-TEST(CaseUtilsTest, DISABLED_DefaultToLowerPerf) {
-  int64_t x = 0;
-  for (uint64_t i = 0; i < kNumHashes * 100; i++) {
-    x += fastToLower(i & 0xFF);
-  }
-  LOG(INFO) << x;
-}
-
-TEST(CaseUtilsTest, DISABLED_ToLowerBaseline) {
-  int64_t x = 0;
-  for (uint64_t i = 0; i < kNumHashes * 100; i++) {
-    x += (i & 0xFF);
   }
   LOG(INFO) << x;
 }

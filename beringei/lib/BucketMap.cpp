@@ -7,14 +7,18 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  */
 
-#include "BucketMap.h"
+#include "beringei/lib/BucketMap.h"
 
-#include "BucketLogWriter.h"
-#include "DataBlockReader.h"
-#include "DataLog.h"
-#include "GorillaStatsManager.h"
-#include "GorillaTimeConstants.h"
-#include "TimeSeries.h"
+#include <folly/Format.h>
+
+#include "beringei/lib/BucketLogWriter.h"
+#include "beringei/lib/BucketUtils.h"
+#include "beringei/lib/DataBlockReader.h"
+#include "beringei/lib/DataLog.h"
+#include "beringei/lib/GorillaStatsManager.h"
+#include "beringei/lib/GorillaTimeConstants.h"
+#include "beringei/lib/LogReader.h"
+#include "beringei/lib/TimeSeries.h"
 
 DEFINE_int32(
     data_point_queue_size,
@@ -34,20 +38,20 @@ namespace gorilla {
 // on each resize.
 const int kRowsAtATime = 10000;
 
-static const std::string kMsPerKeyListRead = ".ms_per_key_list_read";
-static const std::string kMsPerLogFilesRead = ".ms_per_log_files_read";
-static const std::string kMsPerBlockFileRead = ".ms_per_block_file_read";
-static const std::string kMsPerQueueProcessing = ".ms_per_queue_processing";
-static const std::string kDataPointQueueDropped = ".data_point_queue_dropped";
-static const std::string kCorruptKeyFiles = ".corrupt_key_files";
-static const std::string kCorruptLogFiles = ".corrupt_log_files";
-static const std::string kUnknownKeysInLogFiles = ".unknown_keys_in_log_files";
+static const std::string kMsPerKeyListRead = "ms_per_key_list_read";
+static const std::string kMsPerLogFilesRead = "ms_per_log_files_read";
+static const std::string kMsPerBlockFileRead = "ms_per_block_file_read";
+static const std::string kMsPerQueueProcessing = "ms_per_queue_processing";
+static const std::string kDataPointQueueDropped = "data_point_queue_dropped";
+static const std::string kCorruptKeyFiles = "corrupt_key_files";
+static const std::string kCorruptLogFiles = "corrupt_log_files";
+static const std::string kUnknownKeysInLogFiles = "unknown_keys_in_log_files";
 static const std::string kUnknownKeysInBlockMetadataFiles =
-    ".unknown_keys_in_block_metadata_files";
-static const std::string kDataHoles = ".missing_blocks_and_logs";
-static const std::string kMissingLogs = ".missing_seconds_of_log_data";
-static const std::string kDeletionRaces = ".key_deletion_failures";
-static const std::string kDuplicateKeys = ".duplicate_keys_in_key_list";
+    "unknown_keys_in_block_metadata_files";
+static const std::string kDataHoles = "missing_blocks_and_logs";
+static const std::string kMissingLogs = "missing_seconds_of_log_data";
+static const std::string kDeletionRaces = "key_deletion_failures";
+static const std::string kDuplicateKeys = "duplicate_keys_in_key_list";
 
 static const size_t kMaxAllowedKeyLength = 400;
 
@@ -63,8 +67,9 @@ BucketMap::BucketMap(
     int shardId,
     const std::string& dataDirectory,
     std::shared_ptr<KeyListWriter> keyWriter,
-    std::shared_ptr<BucketLogWriter> logWriter,
-    BucketMap::State state)
+    std::shared_ptr<BucketLogWriterIf> logWriter,
+    BucketMap::State state,
+    std::shared_ptr<LogReaderFactory> logReaderFactory)
     : n_(buckets),
       windowSize_(windowSize),
       reliableDataStartTime_(0),
@@ -76,7 +81,8 @@ BucketMap::BucketMap(
       dataDirectory_(dataDirectory),
       keyWriter_(keyWriter),
       logWriter_(logWriter),
-      lastFinalizedBucket_(0) {}
+      lastFinalizedBucket_(0),
+      logReaderFactory_(logReaderFactory) {}
 
 // Insert the given data point, creating a new row if necessary.
 // Returns the number of new rows created (0 or 1) and the number of
@@ -139,7 +145,7 @@ std::pair<int, int> BucketMap::put(
   // Prepare a row now to minimize critical section.
   auto newRow = std::make_shared<std::pair<std::string, BucketedTimeSeries>>();
   newRow->first = key;
-  newRow->second.reset(n_);
+  newRow->second.reset(n_, b, value.unixTime);
   newRow->second.put(b, value, &storage_, -1, &category);
 
   int index = 0;
@@ -174,7 +180,7 @@ std::pair<int, int> BucketMap::put(
   }
 
   // Write the new key out to disk.
-  keyWriter_->addKey(shardId_, index, newRow->first, category);
+  keyWriter_->addKey(shardId_, index, newRow->first, category, value.unixTime);
   logWriter_->logData(shardId_, index, value.unixTime, value.value);
 
   return {1, 1};
@@ -213,25 +219,46 @@ void BucketMap::erase(int index, Item item) {
   folly::RWSpinLock::WriteHolder guard(lock_);
 
   if (rows_[index] != item || !item) {
+    guard.reset();
     // The arguments provided are no longer valid.
     GorillaStatsManager::addStatValue(kDeletionRaces);
     return;
   }
 
   auto it = map_.find(item->first.c_str());
-  if (it != map_.end() && it->second == index) {
+  bool race = it == map_.end() || it->second != index;
+  if (!race) {
     // The map still points to the right entry.
     map_.erase(it);
-  } else {
-    GorillaStatsManager::addStatValue(kDeletionRaces);
   }
 
+  auto row = rows_[index];
   rows_[index].reset();
   freeList_.push(index);
+
+  // Deallocation on reference count decrease to zero is unlocked
+  guard.reset();
+  row.reset();
+
+  if (race) {
+    GorillaStatsManager::addStatValue(kDeletionRaces);
+  }
 }
 
-uint32_t BucketMap::bucket(uint64_t unixTime) {
-  return (uint32_t)(unixTime / windowSize_);
+uint32_t BucketMap::bucket(uint64_t unixTime) const {
+  return BucketUtils::bucket(unixTime, windowSize_, shardId_);
+}
+
+uint64_t BucketMap::timestamp(uint32_t bucket) const {
+  return BucketUtils::timestamp(bucket, windowSize_, shardId_);
+}
+
+uint64_t BucketMap::duration(uint32_t buckets) const {
+  return BucketUtils::duration(buckets, windowSize_);
+}
+
+uint32_t BucketMap::buckets(uint64_t duration) const {
+  return BucketUtils::buckets(duration, windowSize_);
 }
 
 BucketStorage* BucketMap::getStorage() {
@@ -263,7 +290,7 @@ bool BucketMap::setState(BucketMap::State state) {
         FLAGS_data_point_queue_size);
 
     // Deviations are indexed per minute.
-    deviations_.resize(n_ * windowSize_ / kGorillaSecondsPerMinute);
+    deviations_.resize(duration(n_) / kGorillaSecondsPerMinute);
   } else if (state == UNOWNED) {
     tmpMap.swap(map_);
     tmpQueue.swap(freeList_);
@@ -298,7 +325,7 @@ bool BucketMap::setState(BucketMap::State state) {
   return true;
 }
 
-BucketMap::State BucketMap::getState() {
+BucketMap::State BucketMap::getState() const {
   folly::RWSpinLock::ReadHolder guard(lock_);
   return state_;
 }
@@ -366,6 +393,11 @@ int BucketMap::finalizeBuckets(uint32_t lastBucketToFinalize) {
   return bucketsToFinalize;
 }
 
+bool BucketMap::isBehind(uint32_t bucketToFinalize) const {
+  return getState() == OWNED && lastFinalizedBucket_ != 0 &&
+      bucketToFinalize > lastFinalizedBucket_ + 1;
+}
+
 void BucketMap::shutdown() {
   if (getState() == OWNED) {
     logWriter_->stopShard(shardId_);
@@ -388,10 +420,14 @@ void BucketMap::compactKeyList() {
     for (i++; i < items.size(); i++) {
       if (items[i].get()) {
         return std::make_tuple(
-            i, items[i]->first.c_str(), items[i]->second.getCategory());
+            i,
+            items[i]->first.c_str(),
+            items[i]->second.getCategory(),
+            items[i]->second.getFirstUpdateTime(getStorage(), *this));
       }
     }
-    return std::make_tuple<uint32_t, const char*, uint16_t>(0, nullptr, 0);
+    return std::make_tuple<uint32_t, const char*, uint16_t, int32_t>(
+        0, nullptr, 0, 0);
   });
 }
 
@@ -448,10 +484,20 @@ void BucketMap::readData() {
   DataBlockReader reader(shardId_, dataDirectory_);
   {
     std::unique_lock<std::mutex> guard(unreadBlockFilesMutex_);
-    unreadBlockFiles_ = reader.findCompletedBlockFiles();
-    if (unreadBlockFiles_.size() > 0) {
-      checkForMissingBlockFiles();
-      lastFinalizedBucket_ = *unreadBlockFiles_.rbegin();
+    int missingFiles = 0;
+    try {
+      unreadBlockFiles_ = reader.findCompletedBlockFiles();
+      if (unreadBlockFiles_.size() > 0) {
+        missingFiles = checkForMissingBlockFiles();
+        lastFinalizedBucket_ = *unreadBlockFiles_.rbegin();
+      }
+    } catch (std::exception& e) {
+      LOG(ERROR) << "Failed listing completed block files for shard "
+                 << shardId_ << " : " << e.what();
+      missingFiles = n_;
+    }
+    if (missingFiles > 0) {
+      logMissingBlockFiles(missingFiles);
     }
   }
 
@@ -522,7 +568,7 @@ bool BucketMap::readBlockFiles() {
     for (int i = 0; i < timeSeriesIds.size(); i++) {
       if (timeSeriesIds[i] < rows_.size() && rows_[timeSeriesIds[i]].get()) {
         rows_[timeSeriesIds[i]]->second.setDataBlock(
-            position, n_, storageIds[i]);
+            position, &storage_, storageIds[i]);
       } else {
         GorillaStatsManager::addStatValue(kUnknownKeysInBlockMetadataFiles);
       }
@@ -556,8 +602,7 @@ void BucketMap::readKeyList() {
   PersistentKeyList::readKeys(
       shardId_,
       dataDirectory_,
-      [&](uint32_t id, const char* key, uint16_t category) {
-
+      [&](uint32_t id, const char* key, uint16_t category, int32_t timestamp) {
         if (strlen(key) >= kMaxAllowedKeyLength) {
           LOG(ERROR) << "Key too long. Key file is corrupt for shard "
                      << shardId_;
@@ -580,9 +625,12 @@ void BucketMap::readKeyList() {
           rows_.resize(id + kRowsAtATime);
         }
 
+        // Initialize the row, configuring it to throw away any data
+        // that predates `timestamp`.
         rows_[id].reset(new std::pair<std::string, BucketedTimeSeries>());
         rows_[id]->first = key;
-        rows_[id]->second.reset(n_);
+        rows_[id]->second.reset(
+            n_, (timestamp > 0 ? bucket(timestamp) : 0), timestamp);
         rows_[id]->second.setCategory(category);
         return true;
       });
@@ -615,73 +663,54 @@ void BucketMap::readKeyList() {
 
 void BucketMap::readLogFiles(uint32_t lastBlock) {
   LOG(INFO) << "Reading logs for shard " << shardId_;
-  FileUtils files(shardId_, BucketLogWriter::kLogFilePrefix, dataDirectory_);
+  auto ingestData = [this](
+                        uint32_t key,
+                        int64_t unixTime,
+                        double value,
+                        uint32_t& unknownKeys,
+                        int64_t& lastTimestamp) {
+    {
+      folly::RWSpinLock::ReadHolder guard(lock_);
+      if (key < rows_.size() && rows_[key].get()) {
+        TimeValuePair tv;
+        tv.unixTime = unixTime;
+        tv.value = value;
+        rows_[key]->second.put(bucket(unixTime), tv, &storage_, key, nullptr);
+      } else {
+        unknownKeys++;
+      }
+    }
+
+    int64_t gap = unixTime - lastTimestamp;
+    if (gap > FLAGS_missing_logs_threshold_secs &&
+        lastTimestamp > timestamp(1)) {
+      LOG(ERROR) << folly::sformat(
+          "Shard: {}. {} seconds of missing logs from {} to {}.",
+          shardId_,
+          lastTimestamp,
+          unixTime);
+      GorillaStatsManager::addStatValue(kDataHoles, 1);
+      GorillaStatsManager::addStatValue(kMissingLogs, gap);
+      reliableDataStartTime_ = unixTime;
+    }
+    lastTimestamp = std::max(lastTimestamp, unixTime);
+  };
 
   uint32_t unknownKeys = 0;
-  int64_t lastTimestamp = (lastBlock + 1) * windowSize_;
-
-  for (int64_t id : files.ls()) {
-    if (id < (lastBlock + 1) * windowSize_) {
-      LOG(INFO) << "Skipping log file " << id << " because it's already "
-                << "covered by a block";
-      continue;
-    }
-
-    auto file = files.open(id, "rb", 0);
-    if (!file.file) {
-      LOG(ERROR) << "Could not open logfile for reading";
-      continue;
-    }
-
-    uint32_t bucket = id / windowSize_;
-    DataLogReader::readLog(
-        file, id, [&](uint32_t key, int64_t unixTime, double value) {
-
-          if (unixTime < bucket * windowSize_ ||
-              unixTime > (bucket + 1) * windowSize_) {
-            LOG(ERROR) << "Unix time is out of the expected range: " << unixTime
-                       << " [" << (bucket * windowSize_) << ","
-                       << ((bucket + 1) * windowSize_) << "]";
-            GorillaStatsManager::addStatValue(kCorruptLogFiles);
-
-            // It's better to stop reading this log file here because
-            // none of the data can be trusted after this.
-            return false;
-          }
-
-          folly::RWSpinLock::ReadHolder guard(lock_);
-          if (key < rows_.size() && rows_[key].get()) {
-            TimeValuePair tv;
-            tv.unixTime = unixTime;
-            tv.value = value;
-            rows_[key]->second.put(
-                unixTime / windowSize_, tv, &storage_, key, nullptr);
-          } else {
-            unknownKeys++;
-          }
-
-          int64_t gap = unixTime - lastTimestamp;
-          if (gap > FLAGS_missing_logs_threshold_secs &&
-              lastTimestamp > windowSize_) {
-            LOG(ERROR) << gap << " seconds of missing logs from "
-                       << lastTimestamp << " to " << unixTime << " for shard "
-                       << shardId_;
-            GorillaStatsManager::addStatValue(kDataHoles, 1);
-            GorillaStatsManager::addStatValue(kMissingLogs, gap);
-            reliableDataStartTime_ = unixTime;
-          }
-          lastTimestamp = std::max(lastTimestamp, unixTime);
-
-          return true;
-        });
-    fclose(file.file);
-  }
+  int64_t lastTimestamp = timestamp(lastBlock + 1);
+  auto logReader = logReaderFactory_->getLogReader(
+      shardId_, windowSize_, std::move(ingestData));
+  logReader->readLog(lastBlock, lastTimestamp, unknownKeys);
 
   int64_t now = time(nullptr);
   int64_t gap = now - lastTimestamp;
-  if (gap > FLAGS_missing_logs_threshold_secs && lastTimestamp > windowSize_) {
-    LOG(ERROR) << gap << " seconds of missing logs from " << lastTimestamp
-               << " to now (" << now << ") for shard " << shardId_;
+  if (gap > FLAGS_missing_logs_threshold_secs && lastTimestamp > timestamp(1)) {
+    LOG(ERROR) << folly::sformat(
+        "Shard: {}. {} seconds of missing logs from {} to now ({}).",
+        shardId_,
+        gap,
+        lastTimestamp,
+        now);
     GorillaStatsManager::addStatValue(kDataHoles, 1);
     GorillaStatsManager::addStatValue(kMissingLogs, gap);
     reliableDataStartTime_ = now;
@@ -812,7 +841,11 @@ int64_t BucketMap::getReliableDataStartTime() {
   return reliableDataStartTime_;
 }
 
-void BucketMap::checkForMissingBlockFiles() {
+int BucketMap::getShardId() const {
+  return shardId_;
+}
+
+int BucketMap::checkForMissingBlockFiles() {
   // Just look for holes in the progression of files.
   // Gaps between log and block files will be checked elsewhere.
 
@@ -824,23 +857,23 @@ void BucketMap::checkForMissingBlockFiles() {
       missingFiles++;
     }
   }
+  return missingFiles;
+}
 
-  if (missingFiles > 0) {
-    uint32_t now = bucket(time(nullptr));
+void BucketMap::logMissingBlockFiles(int missingFiles) {
+  uint32_t now = bucket(time(nullptr));
 
-    std::stringstream error;
-    error << missingFiles << " completed block files are missing. Got blocks";
-    for (uint32_t id : unreadBlockFiles_) {
-      error << " " << id;
-    }
-    error << ". Expected blocks in range [" << now - n_ << ", " << now - 1
-          << "]"
-          << " for shard " << shardId_;
-
-    LOG(ERROR) << error.str();
-    GorillaStatsManager::addStatValue(kDataHoles, missingFiles);
-    reliableDataStartTime_ = time(nullptr);
+  std::stringstream error;
+  error << missingFiles << " completed block files are missing. Got blocks";
+  for (uint32_t id : unreadBlockFiles_) {
+    error << " " << id;
   }
+  error << ". Expected blocks in range [" << now - n_ << ", " << now - 1 << "]"
+        << " for shard " << shardId_;
+
+  LOG(ERROR) << error.str();
+  GorillaStatsManager::addStatValue(kDataHoles, missingFiles);
+  reliableDataStartTime_ = time(nullptr);
 }
 
 int BucketMap::indexDeviatingTimeSeries(
@@ -852,7 +885,7 @@ int BucketMap::indexDeviatingTimeSeries(
     return 0;
   }
 
-  int totalMinutes = n_ * windowSize_ / kGorillaSecondsPerMinute;
+  int totalMinutes = duration(n_) / kGorillaSecondsPerMinute;
 
   CHECK_EQ(totalMinutes, deviations_.size());
 
@@ -918,6 +951,12 @@ int BucketMap::indexDeviatingTimeSeries(
   }
 
   folly::RWSpinLock::WriteHolder guard(lock_);
+  if (state_ != OWNED) {
+    guard.reset();
+    LOG(WARNING) << "Shard " << shardId_
+                 << " ownership change while indexing deviations.";
+    return 0;
+  }
   int deviationsIndexed = 0;
   for (int i = indexingStartTime; i <= endTime; i += kGorillaSecondsPerMinute) {
     int pos = i / kGorillaSecondsPerMinute % totalMinutes;
@@ -934,7 +973,7 @@ std::vector<BucketMap::Item> BucketMap::getDeviatingTimeSeries(
     return {};
   }
 
-  int totalMinutes = n_ * windowSize_ / kGorillaSecondsPerMinute;
+  int totalMinutes = duration(n_) / kGorillaSecondsPerMinute;
   CHECK_EQ(totalMinutes, deviations_.size());
 
   std::vector<BucketMap::Item> deviations;
@@ -950,5 +989,6 @@ std::vector<BucketMap::Item> BucketMap::getDeviatingTimeSeries(
 
   return deviations;
 }
-}
-} // facebook::gorilla
+
+} // namespace gorilla
+} // namespace facebook

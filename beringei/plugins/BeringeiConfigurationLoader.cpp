@@ -10,7 +10,6 @@
 #include "BeringeiConfigurationLoader.h"
 
 #include <folly/FileUtil.h>
-#include <thrift/lib/cpp/util/ThriftSerializer.h>
 #include <thrift/lib/cpp2/protocol/Serializer.h>
 
 using apache::thrift::SimpleJSONSerializer;
@@ -104,6 +103,7 @@ BeringeiConfigurationLoader::getInternalConfiguration(
     BeringeiInternalServiceInfo serviceInfo;
     serviceInfo.location = service.location;
     serviceInfo.isLoggingNewKeysEnabled = service.isLoggingNewKeysEnabled;
+    serviceInfo.shardMap.resize(service.shardMap.size());
 
     for (auto& shard : service.shardMap) {
       BeringeiInternalHostInfo hostInfo;

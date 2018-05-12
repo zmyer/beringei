@@ -20,7 +20,7 @@
 #include "DataBlock.h"
 #include "DataBlockReader.h"
 
-#include <folly/RWSpinLock.h>
+#include <folly/synchronization/RWSpinLock.h>
 
 namespace facebook {
 namespace gorilla {
@@ -36,6 +36,7 @@ class BucketStorage {
   typedef uint64_t BucketStorageId;
 
   static const BucketStorageId kInvalidId;
+  static const BucketStorageId kDisabledId;
   static const uint32_t kPageSize;
 
   static const std::string kDataPrefix;

@@ -7,33 +7,67 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  */
 
-#include "BucketedTimeSeries.h"
+#include "beringei/lib/BucketedTimeSeries.h"
 
-namespace facebook {
-namespace gorilla {
+#include <folly/synchronization/CallOnce.h>
+
+#include "beringei/lib/BucketMap.h"
+#include "beringei/lib/GorillaStatsManager.h"
 
 DEFINE_int32(
     mintimestampdelta,
     30,
     "Values coming in faster than this are considered spam");
 
-static const uint16_t kDefaultCategory = 0;
+namespace facebook {
+namespace gorilla {
 
-BucketedTimeSeries::BucketedTimeSeries() {}
+static const uint16_t kDefaultCategory = 0;
+// Number of buckets expired with data points
+static const std::string kBucketsExpiredTotal = "buckets_expired_total";
+// Subset which were never queried
+static const std::string kBucketsExpiredQueried = "buckets_expired_queried";
+
+// Number of time series streams committed to buckets
+static const std::string TimeSeriesStreamsTotal = "time_series_streams_total";
+// Subset which were never queried
+static const std::string TimeSeriesStreamsQueried =
+    "time_series_streams_queried";
+
+BucketedTimeSeries::BucketedTimeSeries() {
+  static folly::once_flag flag;
+  folly::call_once(flag, [&]() {
+    GorillaStatsManager::addStatExportType(kBucketsExpiredTotal, SUM);
+    GorillaStatsManager::addStatExportType(kBucketsExpiredTotal, AVG);
+    GorillaStatsManager::addStatExportType(kBucketsExpiredQueried, SUM);
+    GorillaStatsManager::addStatExportType(kBucketsExpiredQueried, AVG);
+
+    GorillaStatsManager::addStatExportType(TimeSeriesStreamsTotal, SUM);
+    GorillaStatsManager::addStatExportType(TimeSeriesStreamsTotal, AVG);
+    GorillaStatsManager::addStatExportType(TimeSeriesStreamsQueried, SUM);
+    GorillaStatsManager::addStatExportType(TimeSeriesStreamsQueried, AVG);
+  });
+}
 
 BucketedTimeSeries::~BucketedTimeSeries() {}
 
-void BucketedTimeSeries::reset(uint8_t n) {
+void BucketedTimeSeries::reset(
+    uint8_t n,
+    uint32_t minBucket,
+    int64_t minTimestamp) {
   queriedBucketsAgo_ = std::numeric_limits<uint8_t>::max();
   lock_.init();
-  current_ = 0;
+  current_ = minBucket;
   blocks_.reset(new BucketStorage::BucketStorageId[n]);
 
   for (int i = 0; i < n; i++) {
-    blocks_[i] = BucketStorage::kInvalidId;
+    // Blacklist older buckets if `minBucket` was set.
+    blocks_[i] = (minBucket == 0) ? BucketStorage::kInvalidId
+                                  : BucketStorage::kDisabledId;
   }
+  blocks_[current_ % n] = BucketStorage::kInvalidId;
   count_ = 0;
-  stream_.reset();
+  stream_.reset(minTimestamp, FLAGS_mintimestampdelta);
   stream_.extraData = kDefaultCategory;
 }
 
@@ -114,15 +148,32 @@ void BucketedTimeSeries::open(
   if (current_ == 0) {
     // Skip directly to the new value.
     current_ = next;
+    blocks_[current_ % storage->numBuckets()] = BucketStorage::kInvalidId;
     return;
   }
+
+  int bucketsExpired = 0;
+  int bucketsExpiredQueried = 0;
 
   // Wipe all the blocks in between.
   while (current_ != next) {
     // Reset the block we're about to replace.
     auto& block = blocks_[current_ % storage->numBuckets()];
 
+    if (block != BucketStorage::kInvalidId &&
+        block != BucketStorage::kDisabledId) {
+      ++bucketsExpired;
+      // Can't distinguish between queries for current_ and newer
+      if (queriedBucketsAgo_ <= storage->numBuckets()) {
+        ++bucketsExpiredQueried;
+      }
+    }
+
     if (count_ > 0) {
+      GorillaStatsManager::addStatValue(TimeSeriesStreamsTotal);
+      if (queriedBucketsAgo_ == 0) {
+        GorillaStatsManager::addStatValue(TimeSeriesStreamsQueried);
+      }
       // Copy out the active data.
       block = storage->store(
           current_, stream_.getDataPtr(), stream_.size(), count_, timeSeriesId);
@@ -139,6 +190,10 @@ void BucketedTimeSeries::open(
       queriedBucketsAgo_++;
     }
   }
+
+  GorillaStatsManager::addStatValue(kBucketsExpiredTotal, bucketsExpired);
+  GorillaStatsManager::addStatValue(
+      kBucketsExpiredQueried, bucketsExpiredQueried);
 }
 
 void BucketedTimeSeries::setQueried() {
@@ -147,18 +202,27 @@ void BucketedTimeSeries::setQueried() {
 
 void BucketedTimeSeries::setDataBlock(
     uint32_t position,
-    uint8_t numBuckets,
+    BucketStorage* storage,
     BucketStorage::BucketStorageId id) {
   folly::MSLGuard guard(lock_);
 
-  // Needed for time series that receive data very rarely.
+  // We just loaded block data that is newer than the current bucket.
+  // This is likely because we just haven't received any data for it yet, but
+  // just in case, throw out any data we do have to replace it with what we just
+  // loaded.
   if (position >= current_) {
-    current_ = position + 1;
     count_ = 0;
     stream_.reset();
+    open(position + 1, storage, 0);
   }
 
-  blocks_[position % numBuckets] = id;
+  // Don't store any data older than the configured minimum bucket.
+  // This allows safe shard movement even when timeseries IDs get reused.
+  auto numBuckets = storage->numBuckets();
+  auto& block = blocks_[position % numBuckets];
+  if (block != BucketStorage::kDisabledId) {
+    blocks_[position % numBuckets] = id;
+  }
 }
 
 bool BucketedTimeSeries::hasDataPoints(uint8_t numBuckets) {
@@ -168,7 +232,8 @@ bool BucketedTimeSeries::hasDataPoints(uint8_t numBuckets) {
   }
 
   for (int i = 0; i < numBuckets; i++) {
-    if (blocks_[i] != BucketStorage::kInvalidId) {
+    if (blocks_[i] != BucketStorage::kInvalidId &&
+        blocks_[i] != BucketStorage::kDisabledId) {
       return true;
     }
   }
@@ -186,9 +251,33 @@ void BucketedTimeSeries::setCategory(uint16_t category) {
   stream_.extraData = category;
 }
 
+int32_t BucketedTimeSeries::getFirstUpdateTime(
+    BucketStorage* storage,
+    const BucketMap& map) {
+  folly::MSLGuard guard(lock_);
+
+  auto n = storage->numBuckets();
+
+  // Find the first block that has data and return its starting timestamp.
+  for (int i = n; i > 0; i--) {
+    int position = (int)current_ - i;
+    if (position < 0) {
+      continue;
+    }
+
+    auto& block = blocks_[position % storage->numBuckets()];
+    if (block != BucketStorage::kInvalidId &&
+        block != BucketStorage::kDisabledId) {
+      return map.timestamp(position);
+    }
+  }
+
+  return stream_.getFirstTimeStamp();
+}
+
 uint32_t BucketedTimeSeries::getLastUpdateTime(
     BucketStorage* storage,
-    uint32_t windowSize) {
+    const BucketMap& map) {
   folly::MSLGuard guard(lock_);
   uint32_t lastUpdateTime = stream_.getPreviousTimeStamp();
   if (lastUpdateTime != 0) {
@@ -204,13 +293,18 @@ uint32_t BucketedTimeSeries::getLastUpdateTime(
       break;
     }
 
-    if (blocks_[position % storage->numBuckets()] !=
-        BucketStorage::kInvalidId) {
-      return (position + 1) * windowSize;
+    auto& block = blocks_[position % storage->numBuckets()];
+    if (block != BucketStorage::kInvalidId &&
+        block != BucketStorage::kDisabledId) {
+      return map.timestamp(position + 1);
     }
   }
 
   return 0;
 }
+
+int32_t BucketedTimeSeries::getBucketAge(uint32_t bucket) const {
+  return current_ - bucket;
 }
-} // facebook::gorilla
+} // namespace gorilla
+} // namespace facebook

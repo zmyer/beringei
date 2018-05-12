@@ -23,8 +23,8 @@ using namespace facebook;
 using namespace facebook::gorilla;
 using namespace google;
 
-using std::vector;
 using std::string;
+using std::vector;
 
 const int kKeys = 200000;
 const int kKeyListSize = 5000;
@@ -45,7 +45,7 @@ class BucketMapTest : public testing::Test {
   void test(BucketMap& map) {
     TimeValuePair tv;
     tv.value = 100.0;
-    tv.unixTime = 0;
+    tv.unixTime = map.timestamp(1);
 
     // First insertion is 3x as long as bumping counters.
     gorilla::Timer timer(true);
@@ -61,12 +61,17 @@ class BucketMapTest : public testing::Test {
       map.put(keyList_.testStr(i), tv, 0);
     }
     LOG(INFO) << "INSERT 2 : " << timer.get();
-    // sleep(10);
 
+    map.finalizeBuckets(1);
+
+    testReads(map);
+  }
+
+  void testReads(BucketMap& map) {
     // Reads are on par with writes.
     typename BucketedTimeSeries::Output out;
     out.reserve(kKeys);
-    timer.reset();
+    gorilla::Timer timer(true);
     for (int i = 0; i < kKeys; i++) {
       auto row = map.get(keyList_.testStr(i));
       ASSERT_NE(nullptr, row.get());
@@ -88,8 +93,9 @@ class BucketMapTest : public testing::Test {
 
   int insert(BucketMap& map, vector<vector<TimeValuePair>>& samples) {
     gorilla::Timer timer(true);
-    std::atomic<int> inserted(0);
-    std::atomic<int> added(0);
+    int inserted = 0;
+    int added = 0;
+    std::set<std::pair<int, int>> seen;
 
     for (int hour = 0; hour < 24; hour++) {
       for (int i = 0; i < samples.size(); i++) {
@@ -98,13 +104,15 @@ class BucketMapTest : public testing::Test {
           auto ret = map.put(key, tv, 0);
           added += ret.first;
           inserted += ret.second;
+          seen.insert({i, map.bucket(tv.unixTime)});
           tv.unixTime += kGorillaSecondsPerHour;
         }
-      } // );
+      }
     }
     LOG(INFO) << "PUT 24H (" << inserted << " dp) : " << timer.get();
     LOG(INFO) << "ROWS ADDED : " << added;
-    return inserted;
+    LOG(INFO) << "UNIQUE BUCKETS: " << seen.size();
+    return seen.size();
   }
 
   TestKeyList keyList_;
@@ -128,7 +136,8 @@ TEST_F(BucketMapTest, TimeSeries) {
       dir.dirname(),
       keyWriter,
       bucketLogWriter,
-      BucketMap::OWNED);
+      BucketMap::OWNED,
+      std::make_shared<LocalLogReaderFactory>(dir.dirname()));
   test(map);
 }
 
@@ -141,6 +150,8 @@ TEST_F(BucketMapTest, Reload) {
       4 * kGorillaSecondsPerHour, dir.dirname(), 100, 0);
   bucketLogWriter->startShard(10);
 
+  int32_t ts2, ts3;
+
   {
     // Fill, then close the BucketMap.
     auto keyWriter = std::make_shared<KeyListWriter>(dir.dirname(), 100);
@@ -152,14 +163,73 @@ TEST_F(BucketMapTest, Reload) {
         dir.dirname(),
         keyWriter,
         bucketLogWriter,
-        BucketMap::OWNED);
+        BucketMap::OWNED,
+        std::make_shared<LocalLogReaderFactory>(dir.dirname()));
     test(map);
+
+    ts2 = map.timestamp(2);
+    ts3 = map.timestamp(3);
   }
 
   auto keyWriter = std::make_shared<KeyListWriter>(dir.dirname(), 100);
   keyWriter->startShard(10);
+  {
+    // Create a new one, reading the keys from disk.
+    BucketMap map(
+        6,
+        4 * kGorillaSecondsPerHour,
+        10,
+        dir.dirname(),
+        keyWriter,
+        bucketLogWriter,
+        BucketMap::OWNED,
+        std::make_shared<LocalLogReaderFactory>(dir.dirname()));
+    map.setState(BucketMap::PRE_UNOWNED);
+    map.setState(BucketMap::UNOWNED);
 
-  // Create a new one, reading the keys from disk.
+    gorilla::Timer timer(true);
+    map.setState(BucketMap::PRE_OWNED);
+    map.readKeyList();
+    map.readData();
+    while (map.readBlockFiles()) {
+    }
+    LOG(INFO) << "READ FROM DISK : " << timer.get();
+
+    std::vector<BucketMap::Item> items;
+    map.getEverything(items);
+
+    std::set<std::string> keySet;
+    for (auto& item : items) {
+      if (item) {
+        keySet.insert(item->first);
+      }
+    }
+
+    for (int i = 0; i < kKeys; i++) {
+      EXPECT_GT(keySet.count(keyList_.testStr(i)), 0)
+          << "testStr(" << i << ") = " << keyList_.testStr(i);
+    }
+
+    testReads(map);
+  }
+
+  // Now wipe the key_list file and reload the data yet again.
+  // Create a key with a timestamp that post-dates the data on disk so we can
+  // verify it doesn't get loaded.
+  bool one = false;
+  keyWriter->compact(10, [&one, ts2]() {
+    if (!one) {
+      one = true;
+      return std::tuple<uint32_t, const char*, uint16_t, int32_t>{
+          0, "a_key", 0, ts2};
+    }
+    return std::tuple<uint32_t, const char*, uint16_t, int32_t>{
+        0, nullptr, 0, 0};
+  });
+
+  // Read it all again.
+  // This time, insert a point before reading blocks. This point should not have
+  // older data.
   BucketMap map(
       6,
       4 * kGorillaSecondsPerHour,
@@ -167,30 +237,45 @@ TEST_F(BucketMapTest, Reload) {
       dir.dirname(),
       keyWriter,
       bucketLogWriter,
-      BucketMap::OWNED);
+      BucketMap::OWNED,
+      std::make_shared<LocalLogReaderFactory>(dir.dirname()));
   map.setState(BucketMap::PRE_UNOWNED);
   map.setState(BucketMap::UNOWNED);
 
   gorilla::Timer timer(true);
   map.setState(BucketMap::PRE_OWNED);
   map.readKeyList();
-  map.setState(BucketMap::OWNED);
+  map.readData();
+
+  // Add a point. This will get assigned an ID that still has block
+  // data on disk.
+  TimeValuePair tv;
+  tv.value = 100.0;
+  tv.unixTime = ts2;
+  map.put("another_key", tv, 0);
+
+  while (map.readBlockFiles()) {
+  }
   LOG(INFO) << "READ FROM DISK : " << timer.get();
 
-  std::vector<BucketMap::Item> items;
-  map.getEverything(items);
-
-  std::set<std::string> keySet;
-  for (auto& item : items) {
-    if (item) {
-      keySet.insert(item->first);
+  // Make sure we have only the keys we expect.
+  std::vector<BucketMap::Item> everything;
+  map.getEverything(everything);
+  int have = 0;
+  for (auto& thing : everything) {
+    if (thing.get()) {
+      have++;
     }
   }
+  ASSERT_EQ(2, have); // "a_key" and "another_key".
 
-  for (int i = 0; i < kKeys; i++) {
-    EXPECT_GT(keySet.count(keyList_.testStr(i)), 0)
-        << "testStr(" << i << ") = " << keyList_.testStr(i);
-  }
+  // Neither key should be associated with old data.
+  BucketedTimeSeries::Output o;
+  map.get("a_key")->second.get(0, ts3, o, map.getStorage());
+  ASSERT_EQ(1, o.size());
+  o.clear();
+  map.get("another_key")->second.get(0, ts3, o, map.getStorage());
+  ASSERT_EQ(1, o.size());
 }
 
 TEST_F(BucketMapTest, Load) {
@@ -216,16 +301,17 @@ TEST_F(BucketMapTest, Load) {
       dir.dirname(),
       keyWriter,
       bucketLogWriter,
-      BucketMap::OWNED);
+      BucketMap::OWNED,
+      std::make_shared<LocalLogReaderFactory>(dir.dirname()));
   vector<vector<TimeValuePair>> samples;
   for (int i = 0; i < kLoadTestRuns; i++) {
     loadData(samples);
   }
 
-  int inserted = insert(map, samples);
+  int buckets = insert(map, samples);
 
   BucketedTimeSeries::Output out;
-  out.reserve(6 * samples.size());
+  out.reserve(buckets);
   uint64_t begin = 1377721380;
   uint64_t end = 1377730980 + 23 * kGorillaSecondsPerHour;
 
@@ -238,7 +324,7 @@ TEST_F(BucketMapTest, Load) {
   LOG(INFO) << "GET : " << timer.get();
 
   // Verify we got everything back out.
-  EXPECT_EQ(7 * samples.size(), out.size());
+  EXPECT_EQ(buckets, out.size());
 }
 
 TEST_F(BucketMapTest, ShardTransitions) {
@@ -281,7 +367,8 @@ TEST_F(BucketMapTest, QueuedPutNewKey) {
       dir.dirname(),
       keyWriter,
       bucketLogWriter,
-      BucketMap::UNOWNED);
+      BucketMap::UNOWNED,
+      std::make_shared<LocalLogReaderFactory>(dir.dirname()));
 
   TimeValuePair value;
   value.unixTime = time(nullptr);
@@ -343,7 +430,8 @@ TEST_F(BucketMapTest, QueuedPutExistingKey) {
         dir.dirname(),
         keyWriter,
         bucketLogWriter,
-        BucketMap::OWNED);
+        BucketMap::OWNED,
+        std::make_shared<LocalLogReaderFactory>(dir.dirname()));
 
     map.put(kDefaultKey, dp1, 0);
     auto item = map.get(kDefaultKey);
@@ -367,7 +455,8 @@ TEST_F(BucketMapTest, QueuedPutExistingKey) {
       dir.dirname(),
       keyWriter,
       bucketLogWriter,
-      BucketMap::UNOWNED);
+      BucketMap::UNOWNED,
+      std::make_shared<LocalLogReaderFactory>(dir.dirname()));
 
   map.setState(BucketMap::PRE_OWNED);
 
@@ -388,8 +477,8 @@ TEST_F(BucketMapTest, QueuedPutExistingKey) {
 
   BucketedTimeSeries::Output output;
   item->second.get(
-      dp1.unixTime / windowSize,
-      dp3.unixTime / windowSize,
+      map.bucket(dp1.unixTime),
+      map.bucket(dp3.unixTime),
       output,
       map.getStorage());
 
@@ -420,12 +509,13 @@ TEST_F(BucketMapTest, CorruptKeys) {
       dir.dirname(),
       keyWriter,
       bucketLogWriter,
-      BucketMap::UNOWNED);
+      BucketMap::UNOWNED,
+      std::make_shared<LocalLogReaderFactory>(dir.dirname()));
 
   map.setState(BucketMap::PRE_OWNED);
 
-  keyWriter->addKey(10, 0, "key with valid id", 16);
-  keyWriter->addKey(10, 0xDEADBEEF, "key with too large id", 0);
+  keyWriter->addKey(10, 0, "key with valid id", 16, 0);
+  keyWriter->addKey(10, 0xDEADBEEF, "key with too large id", 0, 0);
   keyWriter->stopShard(10);
   keyWriter->flushQueue();
 
@@ -457,12 +547,13 @@ TEST_F(BucketMapTest, DuplicateKeys) {
       dir.dirname(),
       keyWriter,
       bucketLogWriter,
-      BucketMap::UNOWNED);
+      BucketMap::UNOWNED,
+      std::make_shared<LocalLogReaderFactory>(dir.dirname()));
 
   map.setState(BucketMap::PRE_OWNED);
 
-  keyWriter->addKey(10, 0, "duplicate key", 16);
-  keyWriter->addKey(10, 1, "duplicate key", 0);
+  keyWriter->addKey(10, 0, "duplicate key", 16, 0);
+  keyWriter->addKey(10, 1, "duplicate key", 0, 0);
   keyWriter->stopShard(10);
   keyWriter->flushQueue();
 
@@ -498,7 +589,8 @@ static std::unique_ptr<BucketMap> buildBucketMap(
       tempDir,
       keyWriter,
       bucketLogWriter,
-      BucketMap::UNOWNED));
+      BucketMap::UNOWNED,
+      std::make_shared<LocalLogReaderFactory>(tempDir)));
 
   map->setState(BucketMap::PRE_OWNED);
   map->setState(BucketMap::OWNED);
@@ -528,11 +620,12 @@ TEST_F(BucketMapTest, SingleTimeSeriesWithOneDeviation) {
       FileUtils::joinPaths(dir.dirname(), "10"));
 
   auto map = buildBucketMap(dir.dirname().c_str());
+  int start = map->timestamp(0);
 
   int kDeviatingPoint = 5;
   for (int i = 0; i < 10; i++) {
     TimeValuePair value;
-    value.unixTime = i * 60;
+    value.unixTime = start + i * 60;
     value.value = i == kDeviatingPoint ? 10 : 1;
     auto ret = map->put(kDefaultKey, value, 0);
     ASSERT_EQ(1, ret.second);
@@ -540,9 +633,10 @@ TEST_F(BucketMapTest, SingleTimeSeriesWithOneDeviation) {
 
   // The deviating value will be more than 2.0 standard deviations
   // away from the mean.
-  ASSERT_EQ(1, map->indexDeviatingTimeSeries(0, 0, 10 * 60, 2.0));
+  ASSERT_EQ(
+      1, map->indexDeviatingTimeSeries(start, start, start + 10 * 60, 2.0));
   for (int i = 0; i < 10; i++) {
-    auto deviations = map->getDeviatingTimeSeries(i * 60);
+    auto deviations = map->getDeviatingTimeSeries(start + i * 60);
     ASSERT_EQ(i == kDeviatingPoint ? 1 : 0, deviations.size());
   }
 }
@@ -553,9 +647,11 @@ TEST_F(BucketMapTest, SingleTimeSeriesWhereEverythingDeviates) {
       FileUtils::joinPaths(dir.dirname(), "10"));
 
   auto map = buildBucketMap(dir.dirname().c_str());
+  int start = map->timestamp(0);
+
   for (int i = 0; i < 10; i++) {
     TimeValuePair value;
-    value.unixTime = i * 60;
+    value.unixTime = start + i * 60;
     value.value = i % 2 == 0 ? 0 : 100;
     auto ret = map->put(kDefaultKey, value, 0);
     ASSERT_EQ(1, ret.second);
@@ -563,9 +659,10 @@ TEST_F(BucketMapTest, SingleTimeSeriesWhereEverythingDeviates) {
 
   // Every value will be more than 0.1 standard deviations away from
   // the mean.
-  ASSERT_EQ(10, map->indexDeviatingTimeSeries(0, 0, 10 * 60, 0.1));
+  ASSERT_EQ(
+      10, map->indexDeviatingTimeSeries(start, start, start + 10 * 60, 0.1));
   for (int i = 0; i < 10; i++) {
-    auto deviations = map->getDeviatingTimeSeries(i * 60);
+    auto deviations = map->getDeviatingTimeSeries(start + i * 60);
     ASSERT_EQ(1, deviations.size());
   }
 }
@@ -577,11 +674,13 @@ TEST_F(BucketMapTest, MultipleTimeSeriesWithDifferentDeviations) {
 
   auto map = buildBucketMap(dir.dirname().c_str());
 
-  addTestData(map, 0);
+  int start = map->timestamp(0);
+  addTestData(map, start);
 
-  ASSERT_EQ(10, map->indexDeviatingTimeSeries(0, 0, 10 * 60, 2.0));
+  ASSERT_EQ(
+      10, map->indexDeviatingTimeSeries(start, start, start + 10 * 60, 2.0));
   for (int i = 0; i < 10; i++) {
-    auto deviations = map->getDeviatingTimeSeries(i * 60);
+    auto deviations = map->getDeviatingTimeSeries(start + i * 60);
     ASSERT_EQ(1, deviations.size());
 
     string expectedKey = kDefaultKey + std::to_string(i);

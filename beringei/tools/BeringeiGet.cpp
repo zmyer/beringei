@@ -16,6 +16,7 @@
 #include <string>
 
 #include <folly/Conv.h>
+#include <folly/init/Init.h>
 
 using namespace facebook;
 
@@ -40,9 +41,8 @@ DEFINE_int64(
     "Unix timestamp of the end time to query. Must be > --start_time.");
 
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
-  google::SetUsageMessage("[<options>] <key>");
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::SetUsageMessage("[<options>] <key>");
+  folly::init(&argc, &argv, true);
 
   auto beringeiConfig =
       std::make_shared<gorilla::BeringeiConfigurationAdapter>(true);
@@ -61,11 +61,11 @@ int main(int argc, char** argv) {
             << "; End time: " << FLAGS_end_time;
 
   if (argc < 2) {
-    google::ShowUsageWithFlagsRestrict(argv[0], "beringei");
+    gflags::ShowUsageWithFlagsRestrict(argv[0], "beringei");
     return 1;
   }
 
-  int shardCount = beringeiClient->getNumShards();
+  int shardCount = beringeiClient->getMaxNumShards();
   LOG(INFO) << "Config knows about these read services: ";
   for (const auto& rservice : beringeiConfig->getReadServices()) {
     LOG(INFO) << "  " << rservice;
@@ -86,14 +86,16 @@ int main(int argc, char** argv) {
 
   LOG(INFO) << "Key is in shard_id: " << FLAGS_shard_id;
 
-  gorilla::GetShardDataBucketResult shardResult;
-  beringeiClient->getShardDataBucket(
-      FLAGS_start_time - 1201,
-      FLAGS_end_time - 599,
-      FLAGS_shard_id,
-      0,
-      10000,
-      shardResult);
+  gorilla::ScanShardRequest shardRequest;
+
+  shardRequest.shardId = FLAGS_shard_id;
+  shardRequest.begin = FLAGS_start_time - 1201;
+  shardRequest.end = FLAGS_end_time - 599;
+  shardRequest.subshard = 0;
+  shardRequest.numSubshards = 1;
+
+  gorilla::ScanShardResult shardResult;
+  beringeiClient->scanShard(shardRequest, shardResult);
 
   LOG(INFO) << "Get whole shard stats:";
   LOG(INFO) << "Request status: " << (int)shardResult.status;

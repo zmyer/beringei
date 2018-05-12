@@ -16,7 +16,6 @@
 #include <folly/DynamicConverter.h>
 #include <folly/io/IOBuf.h>
 #include <proxygen/httpserver/ResponseBuilder.h>
-#include <thrift/lib/cpp/util/ThriftSerializer.h>
 #include <thrift/lib/cpp2/protocol/Serializer.h>
 
 using apache::thrift::SimpleJSONSerializer;
@@ -51,7 +50,7 @@ void QueryHandler::onEOM() noexcept {
   BeringeiClient client(
       configurationAdapter_, 1, BeringeiClient::kNoWriterThreads);
 
-  int numShards = client.getNumShards();
+  int numShards = client.getMaxNumShards();
   std::vector<std::pair<Key, std::vector<TimeValuePair>>> beringeiResult;
   auto beringeiRequest = createBeringeiRequest(request, numShards);
   client.get(beringeiRequest, beringeiResult);

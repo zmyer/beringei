@@ -14,15 +14,16 @@
 #include <unordered_map>
 #include <vector>
 
-#include "BucketLogWriter.h"
-#include "BucketStorage.h"
-#include "BucketedTimeSeries.h"
-#include "CaseUtils.h"
-#include "KeyListWriter.h"
-#include "PersistentKeyList.h"
-#include "Timer.h"
+#include <folly/synchronization/RWSpinLock.h>
 
-#include <folly/RWSpinLock.h>
+#include "beringei/lib/BucketLogWriter.h"
+#include "beringei/lib/BucketStorage.h"
+#include "beringei/lib/BucketedTimeSeries.h"
+#include "beringei/lib/CaseUtils.h"
+#include "beringei/lib/KeyListWriter.h"
+#include "beringei/lib/LogReader.h"
+#include "beringei/lib/PersistentKeyList.h"
+#include "beringei/lib/Timer.h"
 
 namespace facebook {
 namespace gorilla {
@@ -78,8 +79,9 @@ class BucketMap {
       int shardId,
       const std::string& dataDirectory,
       std::shared_ptr<KeyListWriter> keyWriter,
-      std::shared_ptr<BucketLogWriter> logWriter,
-      State state);
+      std::shared_ptr<BucketLogWriterIf> logWriter,
+      State state,
+      std::shared_ptr<LogReaderFactory> logReaderFactory);
   virtual ~BucketMap() {}
   // Insert the given data point, creating a new row if necessary.
   // Returns the number of new rows created (0 or 1) and the number of
@@ -104,11 +106,12 @@ class BucketMap {
 
   void erase(int index, Item item);
 
-  uint32_t bucket(uint64_t unixTime);
+  uint32_t bucket(uint64_t unixTime) const;
+  uint64_t timestamp(uint32_t bucket) const;
+  uint64_t duration(uint32_t buckets) const;
+  uint32_t buckets(uint64_t duration) const;
 
   BucketStorage* getStorage();
-
-  void flushKeyList();
 
   void compactKeyList();
 
@@ -134,7 +137,7 @@ class BucketMap {
   // transition is not allowed or already in that state.
   bool setState(State state);
 
-  State getState();
+  State getState() const;
 
   // Returns the time in milliseconds it took to add this shard from
   // PRE_OWNED state to OWNED state. If called before the shard is
@@ -154,6 +157,9 @@ class BucketMap {
   // finalized. If the shard is not owned, will return immediately
   // with 0. This function is not thread-safe.
   int finalizeBuckets(uint32_t bucketToFinalize);
+
+  // Returns whether this BucketMap is behind more than 1 bucket.
+  bool isBehind(uint32_t bucketToFinalize) const;
 
   // Process is shutting down. Closes any open files. State will be
   // UNOWNED after this.
@@ -186,6 +192,8 @@ class BucketMap {
   // if a shard has no missing data
   int64_t getReliableDataStartTime();
 
+  int getShardId() const;
+
  private:
   // Load all the datapoints out of the logfiles for this shard that
   // are newer than what is covered by the lastBlock.
@@ -214,10 +222,11 @@ class BucketMap {
       const TimeValuePair& value,
       uint16_t category);
 
-  void checkForMissingBlockFiles();
+  int checkForMissingBlockFiles();
+  void logMissingBlockFiles(int missingFiles);
 
-  uint8_t n_;
-  int64_t windowSize_;
+  const uint8_t n_;
+  const int64_t windowSize_;
 
   int64_t reliableDataStartTime_;
 
@@ -236,7 +245,7 @@ class BucketMap {
   const std::string dataDirectory_;
 
   std::shared_ptr<KeyListWriter> keyWriter_;
-  std::shared_ptr<BucketLogWriter> logWriter_;
+  std::shared_ptr<BucketLogWriterIf> logWriter_;
   Timer addTimer_;
   std::mutex stateChangeMutex_;
 
@@ -263,6 +272,8 @@ class BucketMap {
 
   // Circular vector for the deviations.
   std::vector<std::vector<uint32_t>> deviations_;
+  std::shared_ptr<LogReaderFactory> logReaderFactory_;
 };
-}
-} // facebook::gorilla
+
+} // namespace gorilla
+} // namespace facebook

@@ -212,7 +212,7 @@ TEST(BucketStorageTest, BigDataFromDisk) {
   vector<uint32_t> timeSeriesIds2;
   vector<uint64_t> storageIds;
   BucketStorage storage(10, shardId, dir.dirname());
-  ASSERT_EQ(true, storage.loadPosition(100, timeSeriesIds2, storageIds));
+  ASSERT_TRUE(storage.loadPosition(100, timeSeriesIds2, storageIds));
   ASSERT_EQ(ids, storageIds);
   ASSERT_EQ(timeSeriesIds, timeSeriesIds2);
 
@@ -226,6 +226,35 @@ TEST(BucketStorageTest, BigDataFromDisk) {
         storage.fetch(100, ids[i], str, itemCount));
     ASSERT_EQ(expectedData, str);
     ASSERT_EQ(100 + i, itemCount);
+  }
+}
+
+TEST(BucketStorageTest, BigDataStoreAfterCleanupWithoutFinalize) {
+  TemporaryDirectory dir("gorilla_data_block");
+  boost::filesystem::create_directories(
+      FileUtils::joinPaths(dir.dirname(), "12"));
+  int64_t shardId = 12;
+
+  vector<BucketStorage::BucketStorageId> ids(5);
+  vector<uint32_t> timeSeriesIds = {100, 200, 300, 400, 500};
+
+  {
+    BucketStorage storage(10, shardId, dir.dirname());
+    for (int i = 0; i < 5; i++) {
+      string data(30000, '0' + i);
+      ids[i] = storage.store(
+          100, data.c_str(), data.length(), 100 + i, timeSeriesIds[i]);
+      ASSERT_NE(BucketStorage::kInvalidId, ids[i]);
+    }
+    storage.clearAndDisable();
+    storage.enable();
+
+    for (int i = 0; i < 5; i++) {
+      string data(30000, '0' + i);
+      ids[i] = storage.store(
+          100, data.c_str(), data.length(), 100 + i, timeSeriesIds[i]);
+      ASSERT_NE(BucketStorage::kInvalidId, ids[i]);
+    }
   }
 }
 
@@ -261,7 +290,7 @@ TEST(BucketStorageTest, DedupedDataFromDisk) {
   vector<uint32_t> timeSeriesIds2;
   vector<uint64_t> storageIds;
   BucketStorage storage(10, shardId, dir.dirname());
-  ASSERT_EQ(true, storage.loadPosition(100, timeSeriesIds2, storageIds));
+  ASSERT_TRUE(storage.loadPosition(100, timeSeriesIds2, storageIds));
   ASSERT_EQ(2048, storageIds.size());
   ASSERT_EQ(2048, timeSeriesIds2.size());
 

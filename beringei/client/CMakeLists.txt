@@ -11,10 +11,12 @@ add_library(
     BeringeiClient.h
     BeringeiClientImpl.h
     BeringeiConfigurationAdapterIf.h
+    BeringeiGetResult.h
     BeringeiNetworkClient.h
     RequestBatchingQueue.h
     BeringeiClient.cpp
     BeringeiClientImpl.cpp
+    BeringeiGetResult.cpp
     BeringeiNetworkClient.cpp
     RequestBatchingQueue.cpp
 )
@@ -24,6 +26,7 @@ target_link_libraries(
     beringei_core
     beringei_thrift
     ${FOLLY_LIBRARIES}
+    ${WANGLE_LIBRARIES}
 )
 
 add_subdirectory(tests)

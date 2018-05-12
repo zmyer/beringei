@@ -15,7 +15,8 @@
 #include <memory>
 #include <vector>
 
-#include "FileUtils.h"
+#include "beringei/lib/DataLogUtil.h"
+#include "beringei/lib/FileUtils.h"
 
 namespace facebook {
 namespace gorilla {
@@ -28,7 +29,7 @@ class DataLogWriter {
   // Initialize a DataLogWriter which will append data to the given file.
   DataLogWriter(FileUtils::File&& out, int64_t baseTime);
 
-  ~DataLogWriter();
+  virtual ~DataLogWriter();
 
   // Appends a data point to the internal buffer. This operation is
   // not thread safe. Caller is responsible for locking. Data will be
@@ -58,5 +59,6 @@ class DataLogReader {
       int64_t baseTime,
       std::function<bool(uint32_t, int64_t, double)>);
 };
-}
-} // facebook:gorilla
+
+} // namespace gorilla
+} // namespace facebook

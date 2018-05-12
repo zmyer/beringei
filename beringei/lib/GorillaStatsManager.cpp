@@ -22,13 +22,24 @@ GorillaStatsManager::~GorillaStatsManager() {}
 void GorillaStatsManager::initialize(
     const std::string& keyPrefix,
     std::unique_ptr<GorillaStatsManager> stats) {
-  keyPrefix_ = keyPrefix;
+  if (!keyPrefix.empty()) {
+    keyPrefix_ = keyPrefix + '.';
+  }
   stats_ = std::move(stats);
 }
 
 void GorillaStatsManager::addStatValue(const std::string& key, int64_t value) {
   if (stats_.get()) {
     stats_->addStatValueInternal(keyPrefix_ + key, value);
+  }
+}
+
+void GorillaStatsManager::addStatValue(
+    const std::string& key,
+    int64_t value,
+    GorillaStatsExportType type) {
+  if (stats_.get()) {
+    stats_->addStatValueInternal(keyPrefix_ + key, value, type);
   }
 }
 

@@ -10,8 +10,12 @@ add_executable(
 
     MockConfigurationAdapter.h
     BeringeiClientTest.cpp
+    BeringeiGetResultTest.cpp
     RequestBatchingQueueTest.cpp
+    TestMain.cpp
 )
+add_dependencies(beringei_client_test_bin gtest_tp)
+
 target_link_libraries(
     beringei_client_test_bin
 

@@ -23,14 +23,13 @@ class SimpleMemoryUsageGuard : public MemoryUsageGuardIf {
   SimpleMemoryUsageGuard();
   explicit SimpleMemoryUsageGuard(double memFractionToUse);
 
-  bool weAreLowOnMemory();
+  bool weAreLowOnMemory() override;
 
  private:
   void updateMemoryStats();
 
   std::atomic<bool> isFreeMemoryRatioLow_;
   folly::FunctionScheduler memoryStatsUpdateRunner_;
-  int64_t memLimitToEnforceKb_;
 };
 }
 } // facebook:gorilla
